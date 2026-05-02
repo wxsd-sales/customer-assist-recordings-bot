@@ -1,0 +1,21 @@
+{
+  "name": "webex-recording-webhook",
+  "version": "1.0.0",
+  "description": "Webhook receiver for Webex converged recording events",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "webex",
+    "webhook",
+    "recording"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^4.21.0",
+    "webex-node": "^3.12.0"
+  }
+}
