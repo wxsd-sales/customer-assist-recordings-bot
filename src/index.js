@@ -44,6 +44,18 @@ const RECORDING_STORAGE_DIR = process.env.RECORDING_STORAGE_DIR === ''
     : path.resolve(process.env.RECORDING_STORAGE_DIR || './recordings');
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 95 * 1024 * 1024);
 
+function parseAllowedQueueNames(raw) {
+    if (!raw || !String(raw).trim()) {
+        return { displayNames: [], lookup: null };
+    }
+    const displayNames = String(raw).split(',').map(s => s.trim()).filter(Boolean);
+    const lookup = new Set(displayNames.map(name => name.toLowerCase()));
+    return { displayNames, lookup };
+}
+
+const { displayNames: ALLOWED_QUEUE_NAME_LIST, lookup: ALLOWED_QUEUE_LOOKUP } =
+    parseAllowedQueueNames(process.env.ALLOWED_QUEUE_NAMES);
+
 const processedRecordings = new Set();
 const personByEmailCache = new Map();
 const MAX_PERSON_CACHE_ENTRIES = 1000;
@@ -157,6 +169,26 @@ function scheduleNextTokenRefresh(expiresInSeconds) {
 
 function sleep(seconds) {
     return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+}
+
+function getQueueNameFromRecording(recording) {
+    if (!recording) return null;
+    const ownerType = (recording.ownerType || '').toUpperCase();
+    if (ownerType === 'CALL_QUEUE') {
+        return recording.ownerName || null;
+    }
+    const calledParty = recording.serviceData && recording.serviceData.calledParty;
+    if (calledParty && calledParty.name) {
+        return calledParty.name;
+    }
+    return null;
+}
+
+function isQueueAllowed(recording) {
+    if (!ALLOWED_QUEUE_LOOKUP) return true;
+    const queueName = getQueueNameFromRecording(recording);
+    if (!queueName) return false;
+    return ALLOWED_QUEUE_LOOKUP.has(queueName.trim().toLowerCase());
 }
 
 function rememberRecording(id) {
@@ -662,25 +694,57 @@ function rateLimitOk(personId, bucket = 'default') {
     return true;
 }
 
-async function fetchRecentRecordings(limit) {
+async function fetchAllRecentRecordingsSorted() {
+    const r = await fetch(LIST_URL, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${WEBEX_ACCESS_TOKEN}`, 'Accept': 'application/json;charset=UTF-8' }
+    });
+    if (!r.ok) {
+        throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    }
+    const data = await r.json();
+    const items = Array.isArray(data.items) ? data.items.slice() : [];
+    items.sort((a, b) => {
+        const ta = new Date(a.timeRecorded || a.createTime || 0).getTime();
+        const tb = new Date(b.timeRecorded || b.createTime || 0).getTime();
+        return tb - ta;
+    });
+    return items;
+}
+
+async function mergeRecordingWithMetadata(recording) {
+    let merged = { ...recording };
+    const metadata = await getRecordingMetadata(recording.id);
+    if (metadata) {
+        const mergedServiceData = { ...(merged.serviceData || {}), ...(metadata.serviceData || {}) };
+        merged = { ...merged, ...metadata, serviceData: mergedServiceData };
+    }
+    return merged;
+}
+
+async function fetchRecentAllowedRecordings(limit) {
     try {
-        const r = await fetch(LIST_URL, {
-            method: 'GET',
-            headers: { 'Authorization': `Bearer ${WEBEX_ACCESS_TOKEN}`, 'Accept': 'application/json;charset=UTF-8' }
-        });
-        if (!r.ok) {
-            throw new Error(`HTTP ${r.status} ${r.statusText}`);
+        const all = await fetchAllRecentRecordingsSorted();
+        if (!ALLOWED_QUEUE_LOOKUP) {
+            return all.slice(0, limit);
         }
-        const data = await r.json();
-        const items = Array.isArray(data.items) ? data.items.slice() : [];
-        items.sort((a, b) => {
-            const ta = new Date(a.timeRecorded || a.createTime || 0).getTime();
-            const tb = new Date(b.timeRecorded || b.createTime || 0).getTime();
-            return tb - ta;
-        });
-        return items.slice(0, limit);
+
+        const matched = [];
+        for (const recording of all) {
+            if (matched.length >= limit) break;
+            let candidate = recording;
+            if (!getQueueNameFromRecording(recording)) {
+                candidate = await mergeRecordingWithMetadata(recording);
+            } else if (!isQueueAllowed(recording)) {
+                continue;
+            }
+            if (isQueueAllowed(candidate)) {
+                matched.push(candidate);
+            }
+        }
+        return matched;
     } catch (e) {
-        console.error('fetchRecentRecordings error:', e.message);
+        console.error('fetchRecentAllowedRecordings error:', e.message);
         return [];
     }
 }
@@ -709,11 +773,12 @@ async function postSingleRecordingFromHistory(recording) {
     const id = recording && recording.id;
     if (!id) return;
 
-    let merged = { ...recording };
-    const metadata = await getRecordingMetadata(id);
-    if (metadata) {
-        const mergedServiceData = { ...(merged.serviceData || {}), ...(metadata.serviceData || {}) };
-        merged = { ...merged, ...metadata, serviceData: mergedServiceData };
+    const merged = await mergeRecordingWithMetadata(recording);
+
+    if (!isQueueAllowed(merged)) {
+        const queueLabel = getQueueNameFromRecording(merged) || '(unknown)';
+        console.log(`  Skipping ${id}: queue "${queueLabel}" is not in ALLOWED_QUEUE_NAMES.`);
+        return;
     }
 
     const ownerType = (merged.ownerType || '').toUpperCase();
@@ -756,14 +821,20 @@ async function postSingleRecordingFromHistory(recording) {
 
 async function respondWithRecentRecordings(count) {
     const safeCount = Math.max(REQUEST_COUNT_MIN, Math.min(REQUEST_COUNT_MAX, Math.floor(Number(count) || REQUEST_COUNT_DEFAULT)));
-    const items = await fetchRecentRecordings(safeCount);
+    const items = await fetchRecentAllowedRecordings(safeCount);
     if (items.length === 0) {
-        await postPlainMessageToRoom('No recordings available yet.');
+        const emptyMsg = ALLOWED_QUEUE_LOOKUP
+            ? `No recordings found for the configured queue(s): ${ALLOWED_QUEUE_NAME_LIST.join(', ')}.`
+            : 'No recordings available yet.';
+        await postPlainMessageToRoom(emptyMsg);
         return;
     }
+    const queueHint = ALLOWED_QUEUE_LOOKUP
+        ? ` (queues: ${ALLOWED_QUEUE_NAME_LIST.join(', ')})`
+        : '';
     const header = items.length < safeCount
-        ? `📂 Showing all ${items.length} available recording(s) (newest first):`
-        : `📂 Showing the last ${items.length} recording(s) (newest first):`;
+        ? `📂 Showing all ${items.length} available recording(s) (newest first)${queueHint}:`
+        : `📂 Showing the last ${items.length} recording(s) (newest first)${queueHint}:`;
     await postPlainMessageToRoom(header);
     for (const recording of items) {
         await postSingleRecordingFromHistory(recording);
@@ -799,16 +870,6 @@ async function handleNewRecording(recordingFromSource, { source }) {
     console.log('='.repeat(60));
 
     let recording = recordingFromSource;
-    let links = recordingFromSource.temporaryDirectDownloadLinks || null;
-
-    if (!links || !(links.recordingDownloadLink || links.audioDownloadLink || links.transcriptDownloadLink)) {
-        console.log('Fetching recording details to resolve download links...');
-        const result = await waitForDownloadLinks(id);
-        if (result.details) {
-            recording = { ...recording, ...result.details };
-        }
-        links = result.links;
-    }
 
     console.log('Fetching recording metadata for queue/agent details...');
     const metadata = await getRecordingMetadata(id);
@@ -820,13 +881,31 @@ async function handleNewRecording(recordingFromSource, { source }) {
     const ownerType = (recording.ownerType || '').toUpperCase();
     const queueName = ownerType === 'CALL_QUEUE' ? (recording.ownerName || null) : null;
 
+    if (queueName) {
+        console.log(`  Queue: ${queueName}`);
+    }
+
+    if (!isQueueAllowed(recording)) {
+        const queueLabel = queueName || getQueueNameFromRecording(recording) || '(unknown)';
+        console.log(`  Skipping ${id}: queue "${queueLabel}" is not in ALLOWED_QUEUE_NAMES.`);
+        return;
+    }
+
+    let links = recordingFromSource.temporaryDirectDownloadLinks || null;
+
+    if (!links || !(links.recordingDownloadLink || links.audioDownloadLink || links.transcriptDownloadLink)) {
+        console.log('Fetching recording details to resolve download links...');
+        const result = await waitForDownloadLinks(id);
+        if (result.details) {
+            recording = { ...recording, ...result.details };
+        }
+        links = result.links;
+    }
+
     const managedBy = recording.serviceData && recording.serviceData.managedBy;
     let agentName = managedBy && managedBy.name ? managedBy.name : null;
     let agentEmail = managedBy && managedBy.actor && managedBy.actor.email ? managedBy.actor.email : null;
 
-    if (queueName) {
-        console.log(`  Queue: ${queueName}`);
-    }
     if (agentName || agentEmail) {
         console.log(`  Agent: ${agentName || ''}${agentEmail ? ` <${agentEmail}>` : ''}`);
     }
@@ -999,7 +1078,8 @@ app.get('/', (req, res) => {
             recordingWebhook: 'POST /webhook/converged-recording'
         },
         websocketListeners: ['messages.created', 'attachmentActions.created'],
-        pollIntervalSeconds: POLL_INTERVAL_SECONDS
+        pollIntervalSeconds: POLL_INTERVAL_SECONDS,
+        allowedQueueNames: ALLOWED_QUEUE_NAME_LIST.length ? ALLOWED_QUEUE_NAME_LIST : null
     });
 });
 
@@ -1013,7 +1093,13 @@ async function init() {
     });
 
     console.log('\nWebex Recording Monitor started');
-    console.log(`Polling every ${POLL_INTERVAL_SECONDS}s for new recordings...\n`);
+    console.log(`Polling every ${POLL_INTERVAL_SECONDS}s for new recordings...`);
+    if (ALLOWED_QUEUE_LOOKUP) {
+        console.log(`Queue filter active — only posting recordings from: ${ALLOWED_QUEUE_NAME_LIST.join(', ')}`);
+    } else {
+        console.log('Queue filter inactive — posting recordings from all queues.');
+    }
+    console.log('');
 
     if (hasRefreshCredentials()) {
         console.log('OAuth refresh credentials detected; rotating access token at startup...');

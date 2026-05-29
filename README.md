@@ -398,6 +398,7 @@ Required scopes on the service app (any subset that covers your usage; the proje
 | `MAX_UPLOAD_BYTES` | no | `99614720` (~95 MB) | Max attachment size. Recordings larger than this are not downloaded; the message falls back to the temp link. |
 | `PORT` | no | `3000` | HTTP port for `/health` and the optional recording webhook. |
 | `POLL_INTERVAL_SECONDS` | no | `10` | Polling interval for new recordings. |
+| `ALLOWED_QUEUE_NAMES` | no | empty (all queues) | Comma-separated Customer Assist **call queue names** to post (case-insensitive). Recordings from other queues are skipped. Example: `BCQTest` posts only that queue and excludes `BCGTest`. |
 | `LINK_READY_MAX_RETRIES` | no | `20` | How many times to re-fetch recording details waiting for download links to populate. |
 | `LINK_READY_RETRY_SECONDS` | no | `10` | Delay between those retries. |
 
